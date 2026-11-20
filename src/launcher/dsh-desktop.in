@@ -1,0 +1,920 @@
+#!/usr/bin/env bash
+# =============================================================================
+# dsh-desktop — lanzador de escritorio para DeepSeek Harness
+#
+# Carcasa Electron para la interfaz web REAL de DeepSeek Harness. El servidor
+# es exactamente el que ejecutarías a mano:
+#
+#     npx @deepseek-ai/dsh web --no-open --port 0
+#
+# Electron arranca ese servidor, captura la URL autenticada que imprime y la
+# carga en una ventana nativa. El servidor conserva el entorno, el workspace y
+# todas las capacidades del usuario; el renderer queda aislado.
+#
+# Uso:
+#   dsh-desktop                         abre la aplicación
+#   dsh-desktop --install               instala acceso, icono y runtime Electron
+#   dsh-desktop --status | --stop       consulta / detiene la instancia
+#   dsh-desktop --doctor                diagnóstico
+#   dsh-desktop --logs [-f]             registros
+#   dsh-desktop --no-window             servidor en primer plano (como npx)
+#   dsh-desktop -- [args para dsh web]  argumentos extra
+# =============================================================================
+set -euo pipefail
+set +m
+
+APP_NAME="DeepSeek Harness"
+APP_ID="deepseek-harness"
+SCRIPT_VERSION="1.0.0"
+PAYLOAD_VERSION="2"
+DEFAULT_ELECTRON_VERSION="45.4.1"
+DEFAULT_SPEC="@deepseek-ai/dsh"
+DEFAULT_START_TIMEOUT="180"
+
+SELF_PATH="$(readlink -f "$0" 2>/dev/null || printf '%s' "$0")"
+
+QUIET=0
+CLI_DEBUG=0
+CMD="launch"
+PASS_ARGS=()
+PURGE=0
+INSTALL_RUNTIME=1
+LOG_FOLLOW=0
+ELECTRON_PID=""
+SESSION_ID=""
+SESSION_DIR=""
+
+# ---------------------------------------------------------------------------
+# Utilidades
+# ---------------------------------------------------------------------------
+
+timestamp() { date '+%Y-%m-%dT%H:%M:%S%z'; }
+
+log() {
+  [ -n "${LAUNCHER_LOG:-}" ] || return 0
+  printf '[%s] %s\n' "$(timestamp)" "$*" >>"$LAUNCHER_LOG" 2>/dev/null || true
+}
+
+notify_error() {
+  local message="$*"
+  log "ERROR: $message"
+  [ "$QUIET" = 1 ] && return 0
+  if [ -t 1 ] || [ -t 2 ]; then
+    printf '%s: %s\n' "$APP_NAME" "$message" >&2
+    return 0
+  fi
+  if command -v zenity >/dev/null 2>&1 && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
+    zenity --error --title="$APP_NAME" --text="$message" --width=560 2>/dev/null || true
+  elif command -v kdialog >/dev/null 2>&1 && { [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; }; then
+    kdialog --title "$APP_NAME" --error "$message" 2>/dev/null || true
+  else
+    printf '%s: %s\n' "$APP_NAME" "$message" >&2
+  fi
+}
+
+node_version_ok() {
+  local bin="$1" version
+  [ -x "$bin" ] || return 1
+  version="$("$bin" -p 'process.versions.node' 2>/dev/null)" || return 1
+  [ -n "$version" ] || return 1
+  [ "$(printf '%s\n%s\n' "24.9.0" "$version" | sort -V | head -n 1)" = "24.9.0" ]
+}
+
+pid_cmd_has() {
+  local pid="$1" pattern="$2"
+  [ -r "/proc/$pid/cmdline" ] && tr '\0' ' ' <"/proc/$pid/cmdline" | grep -q -- "$pattern"
+}
+
+wait_pid_gone() {
+  local pid="$1" tenths="${2:-100}" count=0
+  while kill -0 "$pid" 2>/dev/null; do
+    count=$((count + 1))
+    [ "$count" -ge "$tenths" ] && return 1
+    sleep 0.1
+  done
+  return 0
+}
+
+rotate_log() {
+  local file="$1" size=0
+  [ -f "$file" ] || return 0
+  size="$(stat -c%s "$file" 2>/dev/null || printf '0')"
+  if [ "${size:-0}" -gt 5242880 ] 2>/dev/null; then
+    mv -f "$file" "$file.1" 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Rutas y configuración
+# ---------------------------------------------------------------------------
+
+resolve_dirs() {
+  : "${HOME:?HOME no está definido}"
+  XDG_CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
+  XDG_DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+  XDG_STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
+  XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/tmp/dsh-desktop-$UID}"
+
+  CONFIG_DIR="$XDG_CONFIG_HOME/deepseek-harness"
+  DATA_DIR="$XDG_DATA_HOME/deepseek-harness"
+  STATE_DIR="$XDG_STATE_HOME/deepseek-harness"
+  RUNTIME_DIR="$XDG_RUNTIME_DIR/deepseek-harness"
+  BIN_DIR="$HOME/.local/bin"
+  APPS_DIR="$XDG_DATA_HOME/applications"
+  ICON_DIR="$XDG_DATA_HOME/icons/hicolor/192x192/apps"
+  ENV_FILE="$CONFIG_DIR/desktop.env"
+  DESKTOP_FILE="$APPS_DIR/$APP_ID.desktop"
+  APP_BASE="$DATA_DIR/app"
+  ELECTRON_HOME="$DATA_DIR/electron"
+  SERVER_LOG="$STATE_DIR/server.log"
+  ELECTRON_LOG="$STATE_DIR/electron.log"
+  LAUNCHER_LOG="$STATE_DIR/launcher.log"
+}
+
+ensure_dirs() {
+  mkdir -p "$CONFIG_DIR" "$DATA_DIR" "$STATE_DIR" "$RUNTIME_DIR/sessions" "$APP_BASE" "$APPS_DIR"
+  chmod 700 "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR" "$RUNTIME_DIR/sessions" 2>/dev/null || true
+  chmod 755 "$DATA_DIR" "$APP_BASE" "$APPS_DIR" 2>/dev/null || true
+  touch "$LAUNCHER_LOG" 2>/dev/null || true
+  chmod 600 "$LAUNCHER_LOG" 2>/dev/null || true
+}
+
+load_settings() {
+  if [ -r "$ENV_FILE" ]; then
+    # shellcheck disable=SC1090
+    . "$ENV_FILE"
+  fi
+  WORKSPACE="${DSH_DESKTOP_WORKSPACE:-$HOME}"
+  SPEC="${DSH_DESKTOP_SPEC:-$DEFAULT_SPEC}"
+  PORT="${DSH_DESKTOP_PORT:-0}"
+  ELECTRON_VERSION="${DSH_DESKTOP_ELECTRON_VERSION:-$DEFAULT_ELECTRON_VERSION}"
+  OZONE="${DSH_DESKTOP_OZONE:-auto}"
+  NO_SANDBOX="${DSH_DESKTOP_NO_SANDBOX:-0}"
+  DEBUG_ENABLED="${DSH_DESKTOP_DEBUG:-0}"
+  START_TIMEOUT="${DSH_DESKTOP_START_TIMEOUT:-$DEFAULT_START_TIMEOUT}"
+  if [ "$CLI_DEBUG" = 1 ]; then DEBUG_ENABLED=1; fi
+  case "$PORT" in
+    ''|*[!0-9]*) notify_error "DSH_DESKTOP_PORT no es un número: $PORT"; return 1 ;;
+  esac
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Node / npx / Electron
+# ---------------------------------------------------------------------------
+
+resolve_node() {
+  local candidates=() path version best="" best_version=""
+  if [ -n "${DSH_DESKTOP_NODE:-}" ]; then
+    if [ -x "$DSH_DESKTOP_NODE" ] && node_version_ok "$DSH_DESKTOP_NODE"; then
+      NODE_BIN="$DSH_DESKTOP_NODE"
+    else
+      notify_error "DSH_DESKTOP_NODE no es un Node >= 24.9 válido: $DSH_DESKTOP_NODE"
+      return 1
+    fi
+  else
+    command -v node >/dev/null 2>&1 && candidates+=("$(command -v node)")
+    local nvm_dir="${NVM_DIR:-$HOME/.nvm}"
+    for path in "$nvm_dir"/versions/node/v*/bin/node; do
+      [ -x "$path" ] && candidates+=("$path")
+    done
+    for path in "$HOME/.local/bin/node" /usr/local/bin/node /usr/bin/node; do
+      [ -x "$path" ] && candidates+=("$path")
+    done
+    for path in "${candidates[@]}"; do
+      node_version_ok "$path" || continue
+      version="$("$path" -p 'process.versions.node' 2>/dev/null)" || continue
+      if [ -z "$best" ] || [ "$(printf '%s\n%s\n' "$version" "$best_version" | sort -V | tail -n 1)" = "$version" ]; then
+        best="$path"
+        best_version="$version"
+      fi
+    done
+    if [ -z "$best" ]; then
+      notify_error "No se encontró Node.js 24.9 o superior. Instala Node 24+ (por ejemplo: 'nvm install 24') o define DSH_DESKTOP_NODE=/ruta/a/node."
+      return 1
+    fi
+    NODE_BIN="$best"
+  fi
+
+  NODE_DIR="$(dirname "$NODE_BIN")"
+  if [ -n "${DSH_DESKTOP_NPX:-}" ]; then
+    if [ -x "$DSH_DESKTOP_NPX" ]; then
+      NPX="$DSH_DESKTOP_NPX"
+    else
+      notify_error "DSH_DESKTOP_NPX no es ejecutable: $DSH_DESKTOP_NPX"
+      return 1
+    fi
+  elif [ -x "$NODE_DIR/npx" ]; then
+    NPX="$NODE_DIR/npx"
+  elif command -v npx >/dev/null 2>&1; then
+    NPX="$(command -v npx)"
+  else
+    notify_error "No se encontró npx junto a Node ($NODE_BIN). Instala npm/npx."
+    return 1
+  fi
+  if [ -n "${DSH_DESKTOP_NPM:-}" ] && [ -x "$DSH_DESKTOP_NPM" ]; then
+    NPM="$DSH_DESKTOP_NPM"
+  elif [ -x "$NODE_DIR/npm" ]; then
+    NPM="$NODE_DIR/npm"
+  else
+    NPM="$(command -v npm 2>/dev/null || true)"
+  fi
+
+  export PATH="$NODE_DIR:$HOME/.local/bin:$HOME/.rbenv/shims:$HOME/.rbenv/bin:$HOME/.guix-profile/bin:$HOME/.config/guix/current/bin:$HOME/.cargo/bin:$HOME/.bun/bin:$HOME/.deno/bin:$PATH"
+  if [ -n "${DSH_DESKTOP_PATH_PREPEND:-}" ]; then
+    export PATH="$DSH_DESKTOP_PATH_PREPEND:$PATH"
+  fi
+  export DSH_HOME="${DSH_HOME:-$HOME/.dsh}"
+  log "node=$NODE_BIN ($("$NODE_BIN" -v 2>/dev/null || true)) npx=$NPX dsh_home=$DSH_HOME"
+  return 0
+}
+
+resolve_electron() {
+  local candidate=""
+  if [ -n "${DSH_DESKTOP_ELECTRON:-}" ] && [ -x "$DSH_DESKTOP_ELECTRON" ]; then
+    candidate="$DSH_DESKTOP_ELECTRON"
+  elif [ -x "$ELECTRON_HOME/node_modules/electron/dist/electron" ]; then
+    candidate="$ELECTRON_HOME/node_modules/electron/dist/electron"
+  elif command -v electron >/dev/null 2>&1; then
+    candidate="$(command -v electron)"
+  fi
+  [ -n "$candidate" ] || return 1
+  ELECTRON_BIN="$candidate"
+  return 0
+}
+
+installed_electron_version() {
+  local manifest="$ELECTRON_HOME/node_modules/electron/package.json"
+  [ -f "$manifest" ] || return 1
+  "$NODE_BIN" -e 'process.stdout.write(require(process.argv[1]).version)' "$manifest" 2>/dev/null
+}
+
+download_electron_binary() {
+  local installer="$ELECTRON_HOME/node_modules/electron/install.js"
+  local cache="${DSH_DESKTOP_ELECTRON_CACHE:-${XDG_CACHE_HOME:-$HOME/.cache}/electron}"
+  if [ ! -f "$installer" ]; then
+    notify_error "No se encontró el instalador de Electron en $installer."
+    return 1
+  fi
+  mkdir -p "$cache" 2>/dev/null || true
+  printf 'Descargando el binario de Electron %s (unos 100-300 MB)…\n' "$ELECTRON_VERSION"
+  if ! timeout 1800 env electron_config_cache="$cache" ELECTRON_CACHE="$cache" "$NODE_BIN" "$installer"; then
+    notify_error "No se pudo descargar el binario de Electron.\nRevisa la red/proxy o define ELECTRON_MIRROR. También puedes fijar otra versión con DSH_DESKTOP_ELECTRON_VERSION."
+    return 1
+  fi
+  if [ ! -x "$ELECTRON_HOME/node_modules/electron/dist/electron" ]; then
+    notify_error "Electron se instaló pero no se encontró el binario en $ELECTRON_HOME/node_modules/electron/dist/electron."
+    return 1
+  fi
+  return 0
+}
+
+install_electron_runtime() {
+  local wanted="$1" have=""
+  have="$(installed_electron_version 2>/dev/null || true)"
+  if [ "$have" = "$wanted" ] && [ -x "$ELECTRON_HOME/node_modules/electron/dist/electron" ]; then
+    printf '  Electron %s ya está instalado en %s\n' "$have" "$ELECTRON_HOME"
+    return 0
+  fi
+  if [ "$have" != "$wanted" ] || [ ! -f "$ELECTRON_HOME/node_modules/electron/package.json" ]; then
+    [ -n "$NPM" ] || { notify_error "No se encontró npm para instalar Electron."; return 1; }
+    printf 'Instalando el paquete Electron %s con npm…\n' "$wanted"
+    mkdir -p "$ELECTRON_HOME"
+    if [ ! -f "$ELECTRON_HOME/package.json" ]; then
+      printf '{"name":"dsh-desktop-electron-runtime","version":"0.0.0","private":true}\n' >"$ELECTRON_HOME/package.json"
+    fi
+    if ! timeout 1200 "$NPM" install --prefix "$ELECTRON_HOME" --no-audit --no-fund --save-exact "electron@$wanted"; then
+      notify_error "Falló la instalación del paquete Electron. Revisa la red/proxy o define ELECTRON_MIRROR.\nTambién puedes fijar otra versión con DSH_DESKTOP_ELECTRON_VERSION."
+      return 1
+    fi
+  fi
+  if [ ! -x "$ELECTRON_HOME/node_modules/electron/dist/electron" ]; then
+    download_electron_binary || return 1
+  fi
+  local missing=""
+  if command -v ldd >/dev/null 2>&1; then
+    missing="$(ldd "$ELECTRON_HOME/node_modules/electron/dist/electron" 2>/dev/null | awk '/not found/{print $1}' | sort -u | tr '\n' ' ')"
+  fi
+  if [ -n "$missing" ]; then
+    printf '  Aviso: faltan bibliotecas del sistema: %s\n' "$missing"
+    printf '  Instálalas con tu gestor de paquetes (libnss3, libatk-bridge2.0-0, libgtk-3-0, libgbm1, libasound2, libxkbcommon0…).\n'
+  fi
+  printf '  Electron %s instalado en %s\n' "$wanted" "$ELECTRON_HOME"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Payload (Electron + splash + package.json) e icono
+# ---------------------------------------------------------------------------
+
+ensure_icon() {
+  if [ ! -s "$DATA_DIR/icon.png" ]; then
+    if printf '%s' '@@ICON_BASE64@@' | base64 -d >"$DATA_DIR/icon.png" 2>/dev/null; then
+      chmod 644 "$DATA_DIR/icon.png" 2>/dev/null || true
+    else
+      rm -f "$DATA_DIR/icon.png"
+      log "aviso: no se pudo generar el icono"
+    fi
+  fi
+  if [ -s "$DATA_DIR/icon.png" ]; then
+    mkdir -p "$ICON_DIR"
+    cp -f "$DATA_DIR/icon.png" "$ICON_DIR/$APP_ID.png" 2>/dev/null || true
+    chmod 644 "$ICON_DIR/$APP_ID.png" 2>/dev/null || true
+  fi
+}
+
+extract_payload() {
+  APP_DIR="$APP_BASE/$PAYLOAD_VERSION"
+  local marker="$APP_DIR/.complete"
+  if [ ! -f "$marker" ]; then
+    mkdir -p "$APP_DIR"
+    write_main_js >"$APP_DIR/main.js"
+    write_splash >"$APP_DIR/splash.html"
+    write_package_json >"$APP_DIR/package.json"
+    chmod 644 "$APP_DIR"/* 2>/dev/null || true
+    printf '%s\n' "$PAYLOAD_VERSION" >"$marker"
+    chmod 644 "$marker" 2>/dev/null || true
+  fi
+  ensure_icon
+}
+
+write_package_json() {
+  cat <<'DSH_PACKAGE_JSON'
+@@DSH_PACKAGE_JSON@@
+DSH_PACKAGE_JSON
+}
+
+write_splash() {
+  cat <<'DSH_SPLASH_HTML'
+@@DSH_SPLASH_HTML@@
+DSH_SPLASH_HTML
+}
+
+write_main_js() {
+  cat <<'DSH_MAIN_JS'
+@@DSH_MAIN_JS@@
+DSH_MAIN_JS
+}
+
+# ---------------------------------------------------------------------------
+# Instalación / desinstalación
+# ---------------------------------------------------------------------------
+
+write_desktop_entry() {
+  mkdir -p "$APPS_DIR"
+  cat >"$DESKTOP_FILE" <<DSH_DESKTOP_ENTRY
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=$APP_NAME
+GenericName=Agente de programación
+Comment=$APP_NAME — agente de IA con interfaz de escritorio
+Exec="$BIN_DIR/dsh-desktop"
+Icon=$APP_ID
+Terminal=false
+StartupNotify=true
+StartupWMClass=$APP_ID
+Categories=Development;
+Keywords=deepseek;harness;ai;agent;coding;
+DSH_DESKTOP_ENTRY
+  chmod 644 "$DESKTOP_FILE" 2>/dev/null || true
+}
+
+write_env_template() {
+  [ -f "$ENV_FILE" ] && return 0
+  cat >"$ENV_FILE" <<'DSH_ENV_TEMPLATE'
+# Configuración del lanzador de escritorio de DeepSeek Harness.
+# Descomenta y ajusta lo que necesites; se carga al iniciar la aplicación.
+
+# Directorio de trabajo inicial (workspace por defecto de DSH):
+# DSH_DESKTOP_WORKSPACE="$HOME"
+
+# Paquete o versión exacta de DSH que se lanzará con npx:
+# DSH_DESKTOP_SPEC="@deepseek-ai/dsh"
+
+# Puerto fijo (0 = uno libre automático):
+# DSH_DESKTOP_PORT=0
+
+# Rutas extra al principio del PATH del servidor (el PATH de la terminal no
+# llega a las aplicaciones del menú de GNOME):
+# DSH_DESKTOP_PATH_PREPEND="$HOME/.local/bin"
+
+# Versión de Electron del runtime (se instala con --install):
+# DSH_DESKTOP_ELECTRON_VERSION="45.4.1"
+
+# Caché de descarga de Electron (por defecto ~/.cache/electron):
+# DSH_DESKTOP_ELECTRON_CACHE="$HOME/.cache/electron"
+
+# Backend gráfico: auto | x11 | wayland
+# DSH_DESKTOP_OZONE="auto"
+
+# 1 para desactivar el sandbox de Chromium si tu distribución lo bloquea:
+# DSH_DESKTOP_NO_SANDBOX=0
+
+# 1 para desactivar la GPU si la ventana aparece en blanco:
+# DSH_DESKTOP_DISABLE_GPU=0
+
+# 1 para logs detallados y DevTools:
+# DSH_DESKTOP_DEBUG=0
+
+# Timeout de arranque del servidor, en segundos:
+# DSH_DESKTOP_START_TIMEOUT=180
+DSH_ENV_TEMPLATE
+  chmod 600 "$ENV_FILE" 2>/dev/null || true
+}
+
+refresh_caches() {
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database "$APPS_DIR" >/dev/null 2>&1 || true
+  fi
+  if command -v gtk-update-icon-cache >/dev/null 2>&1 && [ -d "$XDG_DATA_HOME/icons/hicolor" ]; then
+    gtk-update-icon-cache -f -t "$XDG_DATA_HOME/icons/hicolor" >/dev/null 2>&1 || true
+  fi
+}
+
+install_self() {
+  local target="$BIN_DIR/dsh-desktop"
+  mkdir -p "$BIN_DIR"
+  if [ "$SELF_PATH" = "$target" ]; then
+    return 0
+  fi
+  install -m 0755 "$SELF_PATH" "$target"
+}
+
+cmd_install() {
+  ensure_dirs
+  load_settings || return 1
+  resolve_node || return 1
+  extract_payload
+  ensure_icon
+  install_self
+  write_desktop_entry
+  write_env_template
+  if [ "$INSTALL_RUNTIME" = 1 ]; then
+    install_electron_runtime "$ELECTRON_VERSION" || return 1
+  else
+    printf '  Omitiendo la instalación del runtime Electron (--no-runtime).\n'
+  fi
+  refresh_caches
+  if command -v desktop-file-validate >/dev/null 2>&1; then
+    desktop-file-validate "$DESKTOP_FILE" || true
+  fi
+
+  cat <<SUMMARY
+
+DeepSeek Harness instalado.
+
+  Lanzador:  $BIN_DIR/dsh-desktop
+  Acceso:    $DESKTOP_FILE
+  Icono:     $ICON_DIR/$APP_ID.png
+  Payload:   $APP_BASE/$PAYLOAD_VERSION
+  Electron:  $ELECTRON_HOME
+  DSH:       $SPEC
+  Workspace: $WORKSPACE
+  Config:    $ENV_FILE
+
+Abre "DeepSeek Harness" desde el menú de aplicaciones de GNOME o ejecuta:
+  $BIN_DIR/dsh-desktop
+
+Comprobaciones:
+  $BIN_DIR/dsh-desktop --doctor
+  $BIN_DIR/dsh-desktop --status
+
+SUMMARY
+}
+
+cmd_uninstall() {
+  ensure_dirs
+  load_settings || true
+  cmd_stop || true
+  rm -f "$DESKTOP_FILE" "$ICON_DIR/$APP_ID.png" "$DATA_DIR/icon.png" "$BIN_DIR/dsh-desktop"
+  rm -rf "$APP_BASE"
+  if [ "$PURGE" = 1 ]; then
+    rm -rf "$ELECTRON_HOME" "$CONFIG_DIR" "$STATE_DIR" "$RUNTIME_DIR"
+    printf 'Runtime, configuración y registros eliminados.\n'
+  else
+    printf 'Accesos y payload eliminados. Se conservan la configuración, los registros y el runtime Electron.\n'
+    printf 'Usa --uninstall --purge para borrarlos también.\n'
+  fi
+  refresh_caches
+  printf 'Las sesiones y credenciales de DSH en %s no se han tocado.\n' "${DSH_HOME:-$HOME/.dsh}"
+}
+
+# ---------------------------------------------------------------------------
+# Estado / parada
+# ---------------------------------------------------------------------------
+
+cmd_stop() {
+  ensure_dirs
+  if [ ! -f "$RUNTIME_DIR/current" ]; then
+    printf 'No hay una instancia de DeepSeek Harness en ejecución.\n'
+    return 0
+  fi
+  local sid
+  sid="$(cat "$RUNTIME_DIR/current" 2>/dev/null || true)"
+  if [ -z "$sid" ]; then
+    rm -f "$RUNTIME_DIR/current"
+    printf 'No hay una instancia en ejecución.\n'
+    return 0
+  fi
+  local dir="$RUNTIME_DIR/sessions/$sid"
+  local lpid="" epid="" spid=""
+
+  if [ -f "$dir/launcher.pid" ]; then lpid="$(cat "$dir/launcher.pid" 2>/dev/null || true)"; fi
+  if [ -f "$dir/electron.pid" ]; then epid="$(cat "$dir/electron.pid" 2>/dev/null || true)"; fi
+  if [ -f "$dir/server.pid" ]; then spid="$(cat "$dir/server.pid" 2>/dev/null || true)"; fi
+
+  if [ -n "$lpid" ] && kill -0 "$lpid" 2>/dev/null && pid_cmd_has "$lpid" "dsh-desktop"; then
+    kill -TERM "$lpid" 2>/dev/null || true
+    wait_pid_gone "$lpid" 120 || kill -KILL "$lpid" 2>/dev/null || true
+  fi
+  if [ -n "$epid" ] && kill -0 "$epid" 2>/dev/null && pid_cmd_has "$epid" "electron"; then
+    kill -TERM "$epid" 2>/dev/null || true
+    wait_pid_gone "$epid" 30 || kill -KILL "$epid" 2>/dev/null || true
+  fi
+  if [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null && pid_cmd_has "$spid" "dsh"; then
+    kill -TERM -- "-$spid" 2>/dev/null || kill -TERM "$spid" 2>/dev/null || true
+    wait_pid_gone "$spid" 50 || kill -KILL -- "-$spid" 2>/dev/null || kill -KILL "$spid" 2>/dev/null || true
+  fi
+
+  rm -rf "$dir" 2>/dev/null || true
+  if [ "$(cat "$RUNTIME_DIR/current" 2>/dev/null || true)" = "$sid" ]; then
+    rm -f "$RUNTIME_DIR/current"
+  fi
+  printf 'DeepSeek Harness detenido.\n'
+}
+
+cmd_status() {
+  ensure_dirs
+  if [ ! -f "$RUNTIME_DIR/current" ]; then
+    printf 'DeepSeek Harness no está en ejecución.\n'
+    return 0
+  fi
+  local sid dir
+  sid="$(cat "$RUNTIME_DIR/current" 2>/dev/null || true)"
+  dir="$RUNTIME_DIR/sessions/$sid"
+  printf 'DeepSeek Harness en ejecución (sesión %s)\n' "$sid"
+  if [ -f "$dir/state.json" ]; then
+    if command -v node >/dev/null 2>&1; then
+      node -e '
+        const fs = require("node:fs")
+        try {
+          const s = JSON.parse(fs.readFileSync(process.argv[1], "utf8"))
+          console.log("  Origen:    " + (s.origin || "(iniciando)"))
+          console.log("  PID app:   " + s.pid)
+          console.log("  PID srv:   " + s.serverPid)
+          console.log("  Workspace: " + s.workspace)
+          console.log("  DSH_HOME:  " + s.dshHome)
+          console.log("  Inicio:    " + s.startedAt)
+        } catch (error) {
+          console.log("  No se pudo leer el estado: " + error.message)
+        }
+      ' "$dir/state.json" 2>/dev/null || cat "$dir/state.json"
+    else
+      cat "$dir/state.json"
+    fi
+  fi
+  local spid
+  spid="$(cat "$dir/server.pid" 2>/dev/null || true)"
+  if [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null; then
+    printf '  Servidor:  vivo (PID %s)\n' "$spid"
+  else
+    printf '  Servidor:  no responde\n'
+  fi
+}
+
+cmd_logs() {
+  ensure_dirs
+  printf 'Registros:\n  %s\n  %s\n  %s\n\n' "$SERVER_LOG" "$ELECTRON_LOG" "$LAUNCHER_LOG"
+  if [ "$LOG_FOLLOW" = 1 ]; then
+    tail -n 60 -F "$SERVER_LOG" "$LAUNCHER_LOG"
+  else
+    tail -n 30 "$SERVER_LOG" 2>/dev/null || true
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Diagnóstico
+# ---------------------------------------------------------------------------
+
+cmd_doctor() {
+  QUIET=1
+  ensure_dirs
+  load_settings || true
+  local problems=0
+
+  printf '== DeepSeek Harness — diagnóstico ==\n\n'
+  printf 'Script:        %s (%s)\n' "$SCRIPT_VERSION" "$SELF_PATH"
+  if [ -r /etc/os-release ]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    printf 'Sistema:       %s\n' "${PRETTY_NAME:-desconocido}"
+  fi
+  printf 'Escritorio:    %s (%s)\n' "${XDG_CURRENT_DESKTOP:-?}" "${XDG_SESSION_TYPE:-?}"
+  if [ -n "${DISPLAY:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    printf 'Display:       OK (%s)\n' "${WAYLAND_DISPLAY:-$DISPLAY}"
+  else
+    printf 'Display:       no disponible (se usaría --no-window)\n'
+    problems=$((problems + 1))
+  fi
+  printf 'Runtime dir:   %s\n' "$RUNTIME_DIR"
+  printf 'DSH_HOME:      %s\n' "${DSH_HOME:-$HOME/.dsh}"
+  printf 'Workspace:     %s\n\n' "$WORKSPACE"
+
+  if resolve_node; then
+    printf 'Node:          %s (%s)\n' "$("$NODE_BIN" -v 2>/dev/null)" "$NODE_BIN"
+    printf 'npx:           %s\n' "$NPX"
+    printf 'DSH (spec):    %s\n' "$SPEC"
+  else
+    printf 'Node:          FALTA (se requiere >= 24.9)\n'
+    problems=$((problems + 1))
+  fi
+
+  if resolve_electron; then
+    printf 'Electron:      %s\n' "$ELECTRON_BIN"
+    if command -v ldd >/dev/null 2>&1; then
+      local missing
+      missing="$(ldd "$ELECTRON_BIN" 2>/dev/null | awk '/not found/{print $1}' | sort -u | tr '\n' ' ')"
+      if [ -n "$missing" ]; then
+        printf 'Bibliotecas:   FALTAN %s\n' "$missing"
+        problems=$((problems + 1))
+      else
+        printf 'Bibliotecas:   OK\n'
+      fi
+    fi
+  else
+    printf 'Electron:      no instalado (ejecuta --install)\n'
+    problems=$((problems + 1))
+  fi
+
+  if [ -f "$DESKTOP_FILE" ]; then
+    printf 'Acceso:        %s\n' "$DESKTOP_FILE"
+    if command -v desktop-file-validate >/dev/null 2>&1; then
+      if desktop-file-validate "$DESKTOP_FILE" >/dev/null 2>&1; then
+        printf 'Validación:    OK\n'
+      else
+        printf 'Validación:    con avisos (ejecuta desktop-file-validate %s)\n' "$DESKTOP_FILE"
+      fi
+    fi
+  else
+    printf 'Acceso:        no instalado (ejecuta --install)\n'
+    problems=$((problems + 1))
+  fi
+
+  if [ -f "$RUNTIME_DIR/current" ]; then
+    printf 'Instancia:     activa (sesión %s)\n' "$(cat "$RUNTIME_DIR/current" 2>/dev/null || true)"
+  else
+    printf 'Instancia:     detenida\n'
+  fi
+
+  if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -q ':3080 '; then
+    printf 'Puerto 3080:   ocupado (puede ser otro host DSH; evita abrir la misma sesión en ambos)\n'
+  fi
+
+  printf '\n'
+  if [ "$problems" -eq 0 ]; then
+    printf 'Diagnóstico: sin problemas críticos.\n'
+    return 0
+  fi
+  printf 'Diagnóstico: %s punto(s) a revisar.\n' "$problems"
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# Arranque
+# ---------------------------------------------------------------------------
+
+print_launch_hint() {
+  printf 'DeepSeek Harness\n'
+  printf '  Logs: %s\n' "$STATE_DIR"
+}
+
+cmd_no_window() {
+  ensure_dirs
+  load_settings || return 1
+  resolve_node || return 1
+  [ -d "$WORKSPACE" ] || WORKSPACE="$HOME"
+  cd "$WORKSPACE"
+  log "modo --no-window: $NPX $SPEC web --port $PORT"
+  printf 'Iniciando el servidor DSH en primer plano (Ctrl+C para terminar)…\n'
+  exec "$NPX" --yes --prefer-offline "$SPEC" web --no-open --host 127.0.0.1 --port "$PORT" "${PASS_ARGS[@]}"
+}
+
+build_server_command_json() {
+  "$NODE_BIN" -e 'process.stdout.write(JSON.stringify(process.argv.slice(1)))' -- \
+    "$NPX" --yes --prefer-offline "$SPEC" web --no-open --host 127.0.0.1 --port "$PORT" "${PASS_ARGS[@]}"
+}
+
+run_electron() {
+  local no_sandbox="$NO_SANDBOX"
+  local flags=()
+  local attempt=1
+  local rc=0
+
+  if [ "$no_sandbox" != 1 ] && command -v unshare >/dev/null 2>&1; then
+    if ! unshare -Ur true 2>/dev/null; then
+      no_sandbox=1
+      log "user namespaces no disponibles; se usará --no-sandbox"
+    fi
+  fi
+  [ "$no_sandbox" = 1 ] && flags+=(--no-sandbox)
+
+  case "$OZONE" in
+    x11) flags+=(--ozone-platform=x11) ;;
+    wayland) flags+=(--ozone-platform=wayland) ;;
+    auto|"") [ -n "${WAYLAND_DISPLAY:-}" ] && flags+=(--ozone-platform-hint=auto) ;;
+  esac
+  [ "${DSH_DESKTOP_DISABLE_GPU:-0}" = "1" ] && flags+=(--disable-gpu)
+
+  while :; do
+    local flag_text="${flags[*]:-}"
+    log "lanzando Electron (intento $attempt) flags=${flag_text:-ninguno}"
+    DSH_DESKTOP_SESSION_DIR="$SESSION_DIR" \
+    DSH_DESKTOP_SESSION_ID="$SESSION_ID" \
+    DSH_DESKTOP_RUNTIME="$RUNTIME_DIR" \
+    DSH_DESKTOP_LOG_DIR="$STATE_DIR" \
+    DSH_DESKTOP_SERVER_LOG="$SERVER_LOG" \
+    DSH_DESKTOP_ELECTRON_LOG="$ELECTRON_LOG" \
+    DSH_DESKTOP_SERVER_CMD="$SERVER_CMD_JSON" \
+    DSH_DESKTOP_WORKSPACE="$WORKSPACE" \
+    DSH_DESKTOP_ICON="$DATA_DIR/icon.png" \
+    DSH_DESKTOP_USER_DATA="$CONFIG_DIR/electron" \
+    DSH_DESKTOP_DEBUG="$DEBUG_ENABLED" \
+    DSH_DESKTOP_VERSION="$SCRIPT_VERSION" \
+    DSH_DESKTOP_LAUNCHER_PID="$$" \
+    DSH_DESKTOP_START_TIMEOUT="$START_TIMEOUT" \
+    "$ELECTRON_BIN" --class="$APP_ID" "${flags[@]}" "$APP_DIR" \
+      > >(sed -u -e 's/\(token=\)[^&[:space:]]*/\1REDACTED/g' >>"$ELECTRON_LOG") 2>&1 &
+    ELECTRON_PID=$!
+    printf '%s\n' "$ELECTRON_PID" >"$SESSION_DIR/electron.pid" 2>/dev/null || true
+    chmod 600 "$SESSION_DIR/electron.pid" 2>/dev/null || true
+
+    rc=0
+    wait "$ELECTRON_PID" || rc=$?
+    ELECTRON_PID=""
+
+    if [ "$rc" -ne 0 ] && [ "$no_sandbox" != 1 ] && [ "$attempt" -eq 1 ] &&
+       grep -qiE 'sandbox|SUID|user namespace' "$ELECTRON_LOG" 2>/dev/null; then
+      log "Electron falló por el sandbox; reintentando con --no-sandbox"
+      flags+=(--no-sandbox)
+      no_sandbox=1
+      attempt=2
+      continue
+    fi
+    return "$rc"
+  done
+}
+
+cleanup() {
+  set +e
+  if [ -n "${ELECTRON_PID:-}" ]; then
+    kill -TERM "$ELECTRON_PID" 2>/dev/null
+    wait_pid_gone "$ELECTRON_PID" 60
+    kill -KILL "$ELECTRON_PID" 2>/dev/null
+  fi
+  if [ -n "${SESSION_DIR:-}" ] && [ -d "$SESSION_DIR" ]; then
+    local spid=""
+    [ -f "$SESSION_DIR/server.pid" ] && spid="$(cat "$SESSION_DIR/server.pid" 2>/dev/null)"
+    if [ -n "$spid" ] && kill -0 "$spid" 2>/dev/null && pid_cmd_has "$spid" "dsh"; then
+      kill -TERM -- "-$spid" 2>/dev/null || kill -TERM "$spid" 2>/dev/null
+      wait_pid_gone "$spid" 50 || kill -KILL -- "-$spid" 2>/dev/null || kill -KILL "$spid" 2>/dev/null
+    fi
+    rm -rf "$SESSION_DIR"
+  fi
+  if [ -n "${SESSION_ID:-}" ] && [ -f "$RUNTIME_DIR/current" ]; then
+    if [ "$(cat "$RUNTIME_DIR/current" 2>/dev/null)" = "$SESSION_ID" ]; then
+      rm -f "$RUNTIME_DIR/current"
+    fi
+  fi
+}
+
+cmd_launch() {
+  ensure_dirs
+  load_settings || return 1
+  resolve_node || return 1
+  if [ ! -d "$WORKSPACE" ]; then
+    notify_error "El directorio de trabajo no existe: $WORKSPACE\nAjusta DSH_DESKTOP_WORKSPACE en $ENV_FILE."
+    return 1
+  fi
+  if ! resolve_electron; then
+    notify_error "Electron no está instalado. Ejecuta primero:\n\n  $BIN_DIR/dsh-desktop --install\n\n(o define DSH_DESKTOP_ELECTRON=/ruta/a/electron)."
+    return 1
+  fi
+  extract_payload
+  rotate_log "$SERVER_LOG"
+  rotate_log "$ELECTRON_LOG"
+
+  if [ -z "${DISPLAY:-}" ] && [ -z "${WAYLAND_DISPLAY:-}" ] && [ "${DSH_DESKTOP_FORCE_WINDOW:-0}" != "1" ]; then
+    log "sin display: se usa --no-window"
+    cmd_no_window
+    return $?
+  fi
+
+  trap cleanup EXIT INT TERM HUP
+
+  SESSION_ID="$(date +%s)-$$-$RANDOM"
+  SESSION_DIR="$RUNTIME_DIR/sessions/$SESSION_ID"
+  mkdir -p "$SESSION_DIR"
+  chmod 700 "$SESSION_DIR" 2>/dev/null || true
+  printf '%s\n' "$$" >"$SESSION_DIR/launcher.pid"
+  chmod 600 "$SESSION_DIR/launcher.pid" 2>/dev/null || true
+
+  SERVER_CMD_JSON="$(build_server_command_json)"
+  cd "$WORKSPACE"
+
+  local rc=0
+  run_electron || rc=$?
+  cleanup
+  trap - EXIT INT TERM HUP
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Ayuda y despacho
+# ---------------------------------------------------------------------------
+
+usage() {
+  cat <<USAGE
+$APP_NAME — lanzador de escritorio ($SCRIPT_VERSION)
+
+Uso:
+  dsh-desktop [opciones] [-- argumentos-para-dsh-web]
+
+Opciones:
+  (sin argumentos)        Abre DeepSeek Harness en una ventana de escritorio.
+  --install               Instala el acceso, el icono y el runtime Electron.
+  --install --no-runtime  Instala el acceso sin descargar Electron.
+  --uninstall [--purge]   Elimina accesos; --purge borra también runtime y config.
+  --status                Muestra la instancia en ejecución.
+  --stop                  Detiene la aplicación y el servidor.
+  --doctor                Diagnóstico del entorno.
+  --logs [-f]             Muestra (o sigue) los registros.
+  --no-window             Ejecuta el servidor en primer plano, como npx.
+  --debug                 Logs detallados y DevTools.
+  --version               Muestra la versión del lanzador.
+  --help                  Muestra esta ayuda.
+
+Argumentos tras --:
+  Se pasan tal cual a \`dsh web\` (por ejemplo: --patch ./extra.yml).
+
+El servidor usa el perfil web, el mismo DSH_HOME y el mismo comando que:
+  npx @deepseek-ai/dsh web --no-open --host 127.0.0.1 --port 0
+
+Configuración: $ENV_FILE
+USAGE
+}
+
+main() {
+  resolve_dirs
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --install) CMD="install" ;;
+      --uninstall) CMD="uninstall" ;;
+      --purge) PURGE=1 ;;
+      --status) CMD="status" ;;
+      --stop) CMD="stop" ;;
+      --doctor) CMD="doctor" ;;
+      --logs)
+        CMD="logs"
+        if [ "${2:-}" = "-f" ]; then
+          LOG_FOLLOW=1
+          shift
+        fi
+        ;;
+      --no-window) CMD="no-window" ;;
+      --no-runtime) INSTALL_RUNTIME=0 ;;
+      --debug) CLI_DEBUG=1 ;;
+      --version|-V)
+        printf '%s\n' "$SCRIPT_VERSION"
+        exit 0
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      --)
+        shift
+        PASS_ARGS=("$@")
+        break
+        ;;
+      *)
+        PASS_ARGS+=("$1")
+        ;;
+    esac
+    shift
+  done
+
+  case "$CMD" in
+    install) cmd_install ;;
+    uninstall) cmd_uninstall ;;
+    status) cmd_status ;;
+    stop) cmd_stop ;;
+    doctor) cmd_doctor ;;
+    logs) cmd_logs ;;
+    no-window) cmd_no_window ;;
+    launch) cmd_launch ;;
+    *) usage; exit 2 ;;
+  esac
+}
+
+main "$@"

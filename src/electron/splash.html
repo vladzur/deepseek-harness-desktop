@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="color-scheme" content="light dark">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DeepSeek Harness</title>
+  <style>
+    :root { color-scheme: light dark; }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      display: grid; place-items: center; padding: 24px;
+      font-family: system-ui, -apple-system, "Segoe UI", Cantarell, Ubuntu, "Noto Sans", sans-serif;
+      background: Canvas; color: CanvasText;
+    }
+    .box { display: flex; flex-direction: column; align-items: center; gap: 16px; text-align: center; }
+    .spinner {
+      width: 42px; height: 42px; border-radius: 50%;
+      border: 3px solid color-mix(in srgb, currentColor 18%, transparent);
+      border-top-color: currentColor;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    h1 { font-size: 18px; font-weight: 600; margin: 0; }
+    p { margin: 0; max-width: 34rem; font-size: 13px; line-height: 1.55; opacity: 0.72; }
+    @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+  </style>
+</head>
+<body>
+  <main class="box">
+    <div class="spinner" role="progressbar" aria-label="Iniciando"></div>
+    <h1>DeepSeek Harness</h1>
+    <p>Iniciando el servidor y cargando la interfaz…</p>
+    <p>La primera vez puede tardar unos segundos mientras se prepara el entorno.</p>
+  </main>
+</body>
+</html>

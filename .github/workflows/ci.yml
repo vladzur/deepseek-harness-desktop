@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Build y comprobaciones
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Compilar el lanzador
+        run: npm run build
+
+      - name: Verificar que dsh-desktop está actualizado
+        run: git diff --exit-code -- dsh-desktop
+
+      - name: Comprobaciones estáticas
+        run: npm run check

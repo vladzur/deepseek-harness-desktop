@@ -1,0 +1,34 @@
+{
+  "name": "deepseek-harness-desktop",
+  "version": "1.0.0",
+  "description": "Lanzador de escritorio para DeepSeek Harness: una ventana Electron que ejecuta el mismo servidor web de npx.",
+  "private": true,
+  "license": "MIT",
+  "author": "vladzur",
+  "repository": {
+    "type": "git",
+    "url": "git+ssh://git@github.com/vladzur/deepseek-harness-desktop.git"
+  },
+  "bugs": {
+    "url": "https://github.com/vladzur/deepseek-harness-desktop/issues"
+  },
+  "homepage": "https://github.com/vladzur/deepseek-harness-desktop#readme",
+  "engines": {
+    "node": ">=24.9.0"
+  },
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "check": "node scripts/check.mjs",
+    "smoke": "bash tests/smoke.sh",
+    "test": "npm run check"
+  },
+  "keywords": [
+    "deepseek",
+    "deepseek-harness",
+    "dsh",
+    "electron",
+    "desktop",
+    "linux",
+    "gnome"
+  ]
+}

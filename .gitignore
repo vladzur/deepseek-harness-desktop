@@ -1,0 +1,15 @@
+# Dependencias (no hay, pero por si acaso)
+node_modules/
+
+# Artefactos temporales del build
+dsh-desktop.tmp
+
+# Registros y estado local de pruebas
+*.log
+test-home/
+tmp/
+.dsh-test/
+
+# Basura de sistemas de archivos
+.DS_Store
+Thumbs.db
